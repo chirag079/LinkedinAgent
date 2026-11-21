@@ -1,15 +1,21 @@
 """
 Draftwise — LinkedIn post writer + reviewer loop (LangGraph + Streamlit)
 
-Run:  streamlit run app.py
-Keys: entered in the UI (OpenAI, Tavily, Groq), verified on submit, kept only in the session.
-Needs: streamlit>=1.40, requests, reportlab  (pip install reportlab)
+Run:   streamlit run app.py
+Keys:  entered in the UI, verified on submit, kept only in the session.
+Needs: streamlit>=1.40 (>=1.46 lets the app open in your system theme), requests, reportlab,
+       langgraph, langchain-core, langchain-openai, langchain-tavily
+       pip install -U streamlit requests reportlab langgraph langchain-core langchain-openai langchain-tavily
+
+Every provider below is reached through its OpenAI-compatible endpoint, so no extra SDKs are needed.
 """
 
 import html
 import io
 import json
+import random
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import Annotated, TypedDict
 from xml.sax.saxutils import escape as xml_escape
@@ -25,12 +31,97 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# id -> (label, placeholder)
-KEY_FIELDS = {
-    "openai": ("OpenAI API key", "sk-…"),
-    "tavily": ("Tavily API key", "tvly-…"),
-    "groq": ("Groq API key", "gsk_…"),
+# ════════════════════════════════════════════════════════════════════════
+#  PROVIDER CATALOG  (all OpenAI-compatible; model IDs rotate — use "Custom" for anything else)
+# ════════════════════════════════════════════════════════════════════════
+
+CUSTOM = "Custom model ID…"
+
+PROVIDERS = {
+    "openai": dict(
+        label="OpenAI", tag="Paid", free=False, base=None, ph="sk-…",
+        url="https://platform.openai.com/api-keys",
+        blurb="Most dependable tool-calling. Pay as you go.",
+        models=["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1", "gpt-4o"],
+    ),
+    "gemini": dict(
+        label="Google Gemini", tag="Free tier", free=True,
+        base="https://generativelanguage.googleapis.com/v1beta/openai/", ph="AIza…",
+        url="https://aistudio.google.com/apikey",
+        blurb="Generous free quota through Google AI Studio.",
+        models=["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"],
+    ),
+    "groq": dict(
+        label="Groq", tag="Free tier", free=True, base="https://api.groq.com/openai/v1", ph="gsk_…",
+        url="https://console.groq.com/keys",
+        blurb="Very fast inference. Free tier with rate limits.",
+        models=["openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+    ),
+    "openrouter": dict(
+        label="OpenRouter", tag="Free models", free=True, base="https://openrouter.ai/api/v1", ph="sk-or-…",
+        url="https://openrouter.ai/keys",
+        blurb="One key, many models. Pick IDs ending in :free.",
+        models=["openai/gpt-oss-20b:free", "meta-llama/llama-3.3-70b-instruct:free"],
+    ),
+    "mistral": dict(
+        label="Mistral", tag="Free tier", free=True, base="https://api.mistral.ai/v1", ph="Paste key",
+        url="https://console.mistral.ai/api-keys",
+        blurb="Free Experiment plan for prototyping.",
+        models=["mistral-small-latest", "mistral-large-latest", "open-mistral-nemo"],
+    ),
+    "cerebras": dict(
+        label="Cerebras", tag="Free tier", free=True, base="https://api.cerebras.ai/v1", ph="csk-…",
+        url="https://cloud.cerebras.ai",
+        blurb="Extremely fast open models. Free tier available.",
+        models=["gpt-oss-120b", "llama-3.3-70b", "qwen-3-32b"],
+    ),
 }
+TAVILY = dict(label="Tavily", ph="tvly-…", url="https://app.tavily.com")
+DEFAULT_PROV = {"w": "openai", "r": "groq"}
+
+
+def key_label(kid: str) -> str:
+    return f"{(TAVILY if kid == 'tavily' else PROVIDERS[kid])['label']} API key"
+
+
+def key_ph(kid: str) -> str:
+    return (TAVILY if kid == "tavily" else PROVIDERS[kid])["ph"]
+
+
+def key_url(kid: str) -> str:
+    return (TAVILY if kid == "tavily" else PROVIDERS[kid])["url"]
+
+
+def resolve(role: str):
+    """(provider id, model id) currently selected for role 'w' (writer) or 'r' (reviewer)."""
+    ss = st.session_state
+    pid = ss.get(f"{role}_prov", DEFAULT_PROV[role])
+    if pid not in PROVIDERS:
+        pid = DEFAULT_PROV[role]
+    m = ss.get(f"{role}_model_{pid}", PROVIDERS[pid]["models"][0])
+    if m == CUSTOM:
+        m = (ss.get(f"{role}_custom_{pid}") or "").strip()
+    return pid, m
+
+
+def research_on() -> bool:
+    return st.session_state.get("research") != "Off"
+
+
+def max_attempts() -> int:
+    return st.session_state.get("max_attempts") or 3
+
+
+def needed_ids() -> list:
+    ids = []
+    for r in ("w", "r"):
+        p = resolve(r)[0]
+        if p not in ids:
+            ids.append(p)
+    if research_on():
+        ids.append("tavily")
+    return ids
+
 
 # ════════════════════════════════════════════════════════════════════════
 #  BACKEND — LangGraph pipeline (built per session, keys never cached)
@@ -39,14 +130,18 @@ KEY_FIELDS = {
 WRITER_SYSTEM_PROMPT = (
     "You are an expert LinkedIn content writer. Your job is to write "
     "engaging, professional LinkedIn posts about the given topic. "
-    "If the topic requires up-to-date information, statistics, or "
-    "current trends, use the web search tool to gather fresh context "
-    "before writing. If you have already received feedback on a "
+    "{search}"
+    "If you have already received feedback on a "
     "previous draft, carefully address every point in the new draft. "
     "Rules for good LinkedIn posts: strong hook in the first line, "
     "1 clear takeaway, easy to skim (short paragraphs), around "
     "150–200 words, ends with a question or call-to-action to invite "
-    "engagement. Do not use hashtags."
+    "engagement. Do not use hashtags. Output only the post text."
+)
+SEARCH_LINE = (
+    "If the topic requires up-to-date information, statistics, or "
+    "current trends, use the web search tool to gather fresh context "
+    "before writing. "
 )
 
 REVIEWER_SYSTEM_PROMPT = (
@@ -76,24 +171,31 @@ def _text(content) -> str:
     return str(content or "")
 
 
-def build_graph(openai_key: str, tavily_key: str, groq_key: str):
-    from langchain_core.messages import HumanMessage, ToolMessage
-    from langchain_groq import ChatGroq
+def make_llm(pid: str, model: str, key: str, temperature: float):
     from langchain_openai import ChatOpenAI
-    from langchain_tavily import TavilySearch
+
+    kw = dict(model=model, api_key=key, temperature=temperature, timeout=90, max_retries=2)
+    if PROVIDERS[pid]["base"]:
+        kw["base_url"] = PROVIDERS[pid]["base"]
+    return ChatOpenAI(**kw)
+
+
+def build_graph(wp, wm, wkey, rp, rm, rkey, tavily_key=None):
+    from langchain_core.messages import HumanMessage, ToolMessage
     from langgraph.graph import END, START, StateGraph
     from langgraph.graph.message import add_messages
     from langgraph.prebuilt import ToolNode
 
-    tools = [TavilySearch(max_results=5, tavily_api_key=tavily_key)]
+    tools = []
+    if tavily_key:
+        from langchain_tavily import TavilySearch
 
-    writer_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.75, api_key=openai_key)
-    writer_llm_with_tool = writer_llm.bind_tools(tools)
-    reviewer_llm = ChatGroq(
-        model="openai/gpt-oss-120b",
-        api_key=groq_key,
-        temperature=0.25,
-    )
+        tools = [TavilySearch(max_results=5, tavily_api_key=tavily_key)]
+
+    writer_llm = make_llm(wp, wm, wkey, 0.75)
+    writer = writer_llm.bind_tools(tools) if tools else writer_llm
+    reviewer_llm = make_llm(rp, rm, rkey, 0.25)
+    system_prompt = WRITER_SYSTEM_PROMPT.replace("{search}", SEARCH_LINE if tools else "")
 
     class State(TypedDict):
         topic: str
@@ -111,21 +213,16 @@ def build_graph(openai_key: str, tavily_key: str, groq_key: str):
         # Came back from the search tool → finish the SAME draft with the results.
         if msgs and isinstance(msgs[-1], ToolMessage):
             last_human = max(i for i, m in enumerate(msgs) if isinstance(m, HumanMessage))
-            response = writer_llm_with_tool.invoke(
-                [("system", WRITER_SYSTEM_PROMPT)] + msgs[last_human:]
-            )
+            response = writer.invoke([("system", system_prompt)] + msgs[last_human:])
             return {"messages": [response]}
 
         attempt = state.get("attempt", 0) + 1
         topic = state["topic"]
         tone = state.get("tone") or "Thoughtful"
+        search_hint = "If you need current info, search the web first." if tools else ""
 
         if attempt == 1:
-            user_message = (
-                f"Write a LinkedIn post on this topic: {topic}. "
-                f"Tone: {tone}. "
-                f"If you need current info, search the web first."
-            )
+            user_message = f"Write a LinkedIn post on this topic: {topic}. Tone: {tone}. {search_hint}"
         else:
             user_message = (
                 f"Your previous draft on '{topic}' was rejected. "
@@ -134,9 +231,7 @@ def build_graph(openai_key: str, tavily_key: str, groq_key: str):
                 f"mentioned. Do not repeat the same mistake."
             )
 
-        response = writer_llm_with_tool.invoke(
-            [("system", WRITER_SYSTEM_PROMPT), ("human", user_message)]
-        )
+        response = writer.invoke([("system", system_prompt), ("human", user_message)])
         return {"messages": [("human", user_message), response], "attempt": attempt}
 
     def extract_draft_node(state: State) -> dict:
@@ -144,9 +239,7 @@ def build_graph(openai_key: str, tavily_key: str, groq_key: str):
 
     def reviewer_node(state: State) -> dict:
         prompt = f"Review this LinkedIn post draft:\n{state['draft']}\nGive your review."
-        response = reviewer_llm.invoke(
-            [("system", REVIEWER_SYSTEM_PROMPT), ("human", prompt)]
-        )
+        response = reviewer_llm.invoke([("system", REVIEWER_SYSTEM_PROMPT), ("human", prompt)])
         review_text = _text(response.content).strip()
         verdict_part = review_text.upper().split("FEEDBACK")[0]
         is_approved = "APPROVED" in verdict_part and "REJECTED" not in verdict_part
@@ -159,7 +252,7 @@ def build_graph(openai_key: str, tavily_key: str, groq_key: str):
 
     def should_use_tool(state: State):
         last = state["messages"][-1]
-        return "tools" if getattr(last, "tool_calls", None) else "extract_draft"
+        return "tools" if tools and getattr(last, "tool_calls", None) else "extract_draft"
 
     def should_stop_looping(state: State):
         if state["is_approved"] or state["attempt"] >= state.get("max_attempts", 3):
@@ -168,30 +261,30 @@ def build_graph(openai_key: str, tavily_key: str, groq_key: str):
 
     g = StateGraph(State)
     g.add_node("writer", writer_node)
-    g.add_node("tools", ToolNode(tools))
     g.add_node("extract_draft", extract_draft_node)
     g.add_node("reviewer", reviewer_node)
+    route = {"extract_draft": "extract_draft"}
+    if tools:
+        g.add_node("tools", ToolNode(tools))
+        g.add_edge("tools", "writer")  # after searching, the writer actually writes the post
+        route["tools"] = "tools"
 
     g.add_edge(START, "writer")
-    g.add_conditional_edges(
-        "writer", should_use_tool, {"tools": "tools", "extract_draft": "extract_draft"}
-    )
-    # after searching, go back to the writer so it can actually write the post
-    g.add_edge("tools", "writer")
+    g.add_conditional_edges("writer", should_use_tool, route)
     g.add_edge("extract_draft", "reviewer")
-    g.add_conditional_edges(
-        "reviewer", should_stop_looping, {END: END, "writer": "writer"}
-    )
+    g.add_conditional_edges("reviewer", should_stop_looping, {END: END, "writer": "writer"})
     return g.compile()
 
 
 def get_graph():
-    """Build the graph for THIS session only; rebuild if keys change."""
+    """Build the graph for THIS session only; rebuild if models or keys change."""
     ss = st.session_state
     creds = ss["creds"]
-    sig = tuple(creds[k] for k in KEY_FIELDS)
+    (wp, wm), (rp, rm) = resolve("w"), resolve("r")
+    tav = creds.get("tavily") if research_on() else None
+    sig = (wp, wm, creds[wp], rp, rm, creds[rp], tav)
     if ss.get("_graph_sig") != sig:
-        ss["_graph"] = build_graph(*sig)
+        ss["_graph"] = build_graph(wp, wm, creds[wp], rp, rm, creds[rp], tav)
         ss["_graph_sig"] = sig
     return ss["_graph"]
 
@@ -199,17 +292,16 @@ def get_graph():
 def _clear_keys():
     for k in ("creds", "_graph", "_graph_sig"):
         st.session_state.pop(k, None)
+    for k in [*PROVIDERS, "tavily"]:
+        st.session_state.pop(f"in_{k}", None)
 
 
 # ── key validation ──────────────────────────────────────────────────────
 
-def _status(method: str, url: str, key: str, **kw):
+def _status(url: str, headers: dict, method: str = "GET", **kw):
     """HTTP status code, or None if the service couldn't be reached."""
     try:
-        r = requests.request(
-            method, url, headers={"Authorization": f"Bearer {key}"}, timeout=12, **kw
-        )
-        return r.status_code
+        return requests.request(method, url, headers=headers, timeout=12, **kw).status_code
     except requests.RequestException:
         return None
 
@@ -219,39 +311,42 @@ def _verdict(code):
         return False, "Couldn’t reach the service"
     if code == 200:
         return True, ""
-    if code in (401, 403):
+    if code in (400, 401, 403):
         return False, "Key was rejected"
     return False, f"Unexpected response ({code})"
 
 
-def validate_keys(keys: dict) -> dict:
-    """Returns {id: (ok, message)}. Uses cheap, read-only endpoints."""
-    out = {}
-    for k, v in keys.items():
-        if not v:
-            out[k] = (False, "Missing")
-    if "openai" not in out:
-        out["openai"] = _verdict(_status("GET", "https://api.openai.com/v1/models", keys["openai"]))
-    if "groq" not in out:
-        out["groq"] = _verdict(
-            _status("GET", "https://api.groq.com/openai/v1/models", keys["groq"])
-        )
-    if "tavily" not in out:
-        code = _status("GET", "https://api.tavily.com/usage", keys["tavily"])
+def _check(kid: str, key: str):
+    if not key:
+        return False, "Missing"
+    bearer = {"Authorization": f"Bearer {key}"}
+    if kid == "tavily":
+        code = _status("https://api.tavily.com/usage", bearer)
         if code not in (200, 401, 403):  # endpoint unavailable → fall back to a 1-result search
-            code = _status(
-                "POST", "https://api.tavily.com/search", keys["tavily"],
-                json={"query": "ping", "max_results": 1},
-            )
-        out["tavily"] = _verdict(code)
-    return out
+            code = _status("https://api.tavily.com/search", bearer, "POST",
+                           json={"query": "ping", "max_results": 1})
+        return _verdict(code)
+    if kid == "gemini":
+        return _verdict(_status("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1",
+                                {"x-goog-api-key": key}))
+    base = (PROVIDERS[kid]["base"] or "https://api.openai.com/v1").rstrip("/")
+    return _verdict(_status(base + ("/key" if kid == "openrouter" else "/models"), bearer))
+
+
+def validate_keys(keys: dict) -> dict:
+    """Returns {id: (ok, message)}. Uses cheap, read-only endpoints, checked in parallel."""
+    with ThreadPoolExecutor(max_workers=len(keys) or 1) as ex:
+        futs = {k: ex.submit(_check, k, v) for k, v in keys.items()}
+        return {k: f.result() for k, f in futs.items()}
 
 
 # ════════════════════════════════════════════════════════════════════════
 #  DESIGN SYSTEM
-#  Color  paper #F3F5F9 · surface #FFF · ink #101828 · cobalt #3B5BFF
-#         mint #12B76A (approved) · rose #F04438 (sent back) · amber #F79009
+#  Light  paper #F3F5F9 · surface #FFF · ink #101828 · cobalt #3B5BFF
+#  Dark   paper #0A0E17 · surface #111826 · ink #EDF1F9 · cobalt #7089FF
+#  Status mint (approved) · rose (sent back) · amber (needs a light edit)
 #  Type   Bricolage Grotesque (display) + Figtree (interface)
+#  Motion one orchestrated entrance, a slow ambient drift, motion that answers actions
 # ════════════════════════════════════════════════════════════════════════
 
 CSS = """
@@ -259,97 +354,169 @@ CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Figtree:wght@400;500;600;700&display=swap');
 
 :root{
-  --paper:#F3F5F9; --surface:#fff; --ink:#101828; --ink-2:#475467; --ink-3:#98A2B3;
-  --line:#E4E8F0; --cobalt:#3B5BFF; --cobalt-soft:#E8ECFF;
-  --mint:#12B76A; --mint-soft:#E6F7EE; --rose:#F04438; --rose-soft:#FEECEB;
-  --amber:#F79009; --amber-soft:#FEF3E2;
+  --paper:#F3F5F9; --surface:#fff; --surface-2:#FAFBFD; --ink:#101828; --ink-2:#475467; --ink-3:#98A2B3;
+  --line:#E4E8F0; --dot:#D5DAE5; --cobalt:#3B5BFF; --cobalt-soft:#E8ECFF;
+  --mint:#12B76A; --mint-ink:#067647; --mint-soft:#E6F7EE; --mint-line:#B7E8CF;
+  --rose:#F04438; --rose-ink:#B42318; --rose-soft:#FEECEB; --rose-line:#FECDCA;
+  --amber:#F79009; --amber-ink:#B54708; --amber-soft:#FEF3E2;
+  --solid:#101828; --on-solid:#fff; --body:#1D2433; --draft:#344054;
+  --skel-a:#EEF1F6; --skel-b:#F8F9FC;
+  --glow1:rgba(59,91,255,.15); --glow2:rgba(18,183,106,.09);
+  --shadow-1:0 1px 2px rgba(16,24,40,.04);
+  --shadow-2:0 1px 2px rgba(16,24,40,.04),0 24px 48px -24px rgba(16,24,40,.16);
   --display:'Bricolage Grotesque',system-ui,sans-serif; --ui:'Figtree',system-ui,sans-serif;
   --ease:cubic-bezier(.22,.8,.3,1);
 }
 
 /* ── page chrome ───────────────────────────────── */
-.stApp{
-  background-color:var(--paper);
-  background-image:radial-gradient(#D5DAE5 1px,transparent 1px);
+.stApp[data-testid="stApp"]{
+  background-color:var(--paper)!important;
+  background-image:radial-gradient(var(--dot) 1px,transparent 1px);
   background-size:26px 26px; font-family:var(--ui); color:var(--ink);
 }
+.stApp::before{ /* slow ambient light behind everything */
+  content:"";position:fixed;inset:-20%;z-index:0;pointer-events:none;
+  background:radial-gradient(38% 32% at 14% 8%,var(--glow1),transparent 70%),
+             radial-gradient(34% 30% at 88% 22%,var(--glow2),transparent 70%),
+             radial-gradient(40% 34% at 55% 98%,var(--glow1),transparent 70%);
+  animation:drift 26s ease-in-out infinite alternate;
+}
+[data-testid="stAppViewContainer"],[data-testid="stMain"],[data-testid="stMainBlockContainer"]{background:transparent!important}
+[data-testid="stAppViewContainer"]{position:relative;z-index:1}
 header[data-testid="stHeader"],#MainMenu,footer,[data-testid="stToolbar"],[data-testid="stSidebar"]{display:none!important}
-.block-container{max-width:1120px!important;padding:2.2rem 1.5rem 5rem!important}
+.block-container{max-width:1120px!important;padding:1.6rem 1.5rem 4rem!important}
 
-/* UI font everywhere — :where() keeps specificity low so our own classes can override it */
 .stApp :where(p,label,div,span,button,input,textarea,li){font-family:var(--ui)}
-/* FIX: Streamlit's icons (eye toggle, expander arrows…) are font ligatures. The old blanket
-   `.stApp span{font-family}` replaced the icon font, so the ligature name ("visibility") showed as text. */
+/* Streamlit's icons are font ligatures — never override their font */
 .stApp [data-testid="stIconMaterial"],.stApp .material-symbols-rounded{font-family:"Material Symbols Rounded"!important}
-.stApp .brand,.stApp .notes-h,.stApp .avatar{font-family:var(--display)}
+.stApp .brand,.stApp .notes-h,.stApp .avatar,.stApp .step .n{font-family:var(--display)}
+.stApp [data-testid="stWidgetLabel"],.stApp [data-testid="stWidgetLabel"] *,
+[data-testid="stExpander"] summary,[data-testid="stExpander"] summary *{color:var(--ink)!important}
+[data-testid="stCaptionContainer"],[data-testid="stCaptionContainer"] *{color:var(--ink-2)!important}
+[data-testid="stToast"]{background:var(--surface)!important;color:var(--ink)!important;border:1px solid var(--line)}
+[data-testid="stToast"] *{color:var(--ink)!important}
+::selection{background:var(--cobalt);color:#fff}
+
+/* theme change glides instead of snapping */
+.post,.note,.pipe,.chip,.st-key-composer,[data-testid="stForm"],.empty-note,.prov,.st-key-mp_w,.st-key-mp_r{
+  transition:background-color .45s var(--ease),border-color .45s var(--ease),color .45s var(--ease),box-shadow .45s var(--ease)}
 
 /* ── top bar ───────────────────────────────────── */
-.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
-.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:21px;letter-spacing:-.02em}
-.brand .mark{width:34px;height:34px;border-radius:10px;background:var(--ink);color:#fff;display:grid;place-items:center}
+.topbar{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:21px;letter-spacing:-.02em;color:var(--ink)}
+.brand .mark{width:34px;height:34px;border-radius:10px;background:var(--solid);color:var(--on-solid);display:grid;place-items:center}
 .brand .mark svg{width:18px;height:18px;animation:spin 14s linear infinite}
 .models{display:flex;gap:8px;flex-wrap:wrap}
-.chip{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border:1px solid var(--line);border-radius:999px;background:#fff;font-size:12.5px;color:var(--ink-2);font-weight:500}
-.chip i{width:7px;height:7px;border-radius:50%;background:var(--cobalt)}
-.chip i.g{background:var(--mint)}
+.chip{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border:1px solid var(--line);border-radius:999px;background:var(--surface);font-size:12.5px;color:var(--ink-2);font-weight:500}
+.chip b{font-weight:700;color:var(--ink)}
+.chip i{width:7px;height:7px;border-radius:50%;background:var(--cobalt);animation:breathe-dot 2.4s ease-in-out infinite}
+.chip i.g{background:var(--mint);animation-delay:.6s}
+.st-key-theme_btn{display:flex;justify-content:flex-end}
+.st-key-theme_btn button{min-height:0!important;padding:.4rem .95rem!important;gap:.4rem}
+.st-key-theme_btn [data-testid="stIconMaterial"]{transition:transform .5s var(--ease)}
+.st-key-theme_btn button:hover [data-testid="stIconMaterial"]{transform:rotate(60deg) scale(1.15)}
 
-/* ── hero (the one entrance) ───────────────────── */
-.hero{padding:54px 0 30px;max-width:760px}
-.hero h1{font-family:var(--display);font-weight:700;font-size:clamp(38px,6vw,64px);line-height:1.02;letter-spacing:-.035em;margin:0 0 16px;color:var(--ink)}
-.hero p{font-size:18px;line-height:1.55;color:var(--ink-2);margin:0;max-width:600px}
-.hero h1,.hero p{animation:rise .8s var(--ease) both}
-.hero p{animation-delay:.12s}
+/* ── hero: the one orchestrated entrance ───────── */
+.hero{padding:44px 0 28px;max-width:780px}
+.hero h1{font-family:var(--display);font-weight:700;font-size:clamp(38px,6vw,64px);line-height:1.02;letter-spacing:-.035em;margin:0 0 18px;color:var(--ink)}
+.hero h1 span{display:block;overflow:hidden;padding-bottom:.06em}
+.hero h1 span b{display:block;font-weight:700;animation:lift .9s var(--ease) both}
+.hero h1 span:nth-child(2) b{animation-delay:.12s}
+.hero p{font-size:18px;line-height:1.55;color:var(--ink-2);margin:0;max-width:600px;animation:fade 1s .45s var(--ease) both}
+.hero .rule{height:3px;width:72px;border-radius:3px;background:var(--cobalt);margin:0 0 22px;transform-origin:left;animation:grow-x .9s .3s var(--ease) both}
 
 /* ── composer ──────────────────────────────────── */
-.st-key-composer{background:#fff;border:1px solid var(--line);border-radius:22px;padding:22px 24px 14px;
-  box-shadow:0 1px 2px rgba(16,24,40,.04),0 24px 48px -24px rgba(16,24,40,.16)}
-.st-key-composer label p{font-weight:600;font-size:14px;color:var(--ink)}
-div[data-baseweb="textarea"]{border-radius:14px!important;border:1px solid var(--line)!important;background:#FAFBFD!important;transition:border-color .2s,box-shadow .2s,background .2s}
-div[data-baseweb="textarea"]:focus-within{border-color:var(--cobalt)!important;background:#fff!important;box-shadow:0 0 0 4px var(--cobalt-soft)}
-div[data-baseweb="textarea"] textarea{background:transparent!important;font-size:16.5px!important;line-height:1.5!important;color:var(--ink)!important}
-div[data-baseweb="input"]{border-radius:12px!important;border:1px solid var(--line)!important}
+.st-key-composer{background:var(--surface);border:1px solid var(--line);border-radius:22px;padding:24px 26px 16px;box-shadow:var(--shadow-2);animation:fade .9s .55s var(--ease) both}
+.step{display:flex;gap:12px;align-items:center;margin:0 0 14px}
+.step .n{width:26px;height:26px;border-radius:50%;background:var(--solid);color:var(--on-solid);display:grid;place-items:center;font-weight:700;font-size:12.5px;flex:none}
+.step b{display:block;font-size:15.5px;font-weight:700;color:var(--ink)}
+.step span.d{display:block;font-size:13px;color:var(--ink-2);line-height:1.4}
+.sep{height:1px;background:var(--line);margin:22px -26px 20px}
+.st-key-composer label p{font-weight:600;font-size:14px}
+
+div[data-baseweb="textarea"]{border-radius:14px!important;border:1px solid var(--line)!important;background:var(--surface-2)!important;transition:border-color .2s,box-shadow .2s,background .2s}
+div[data-baseweb="textarea"]:focus-within{border-color:var(--cobalt)!important;box-shadow:0 0 0 4px var(--cobalt-soft)}
+div[data-baseweb="textarea"] textarea{background:transparent!important;font-size:16.5px!important;line-height:1.5!important;color:var(--ink)!important;-webkit-text-fill-color:var(--ink)}
+div[data-baseweb="input"]{border-radius:12px!important;border:1px solid var(--line)!important;background:var(--surface-2)!important}
+div[data-baseweb="input"]>div{background:transparent!important}
 div[data-baseweb="input"]:focus-within{border-color:var(--cobalt)!important;box-shadow:0 0 0 4px var(--cobalt-soft)}
-div[data-baseweb="input"] input{font-size:15px!important;letter-spacing:.02em}
-.stExpander{border:1px solid var(--line)!important;border-radius:14px!important;background:#FAFBFD;margin-bottom:10px}
-.stExpander summary p{font-weight:600;font-size:14px}
-[data-testid="stForm"]{border:1px solid var(--line)!important;border-radius:16px!important;background:#FAFBFD;padding:18px 20px 14px!important;margin-bottom:10px}
+div[data-baseweb="input"] input{font-size:15px!important;letter-spacing:.02em;color:var(--ink)!important;-webkit-text-fill-color:var(--ink)}
+div[data-baseweb="input"] button{background:transparent!important;color:var(--ink-2)!important}
+textarea::placeholder,input::placeholder{color:var(--ink-3)!important;-webkit-text-fill-color:var(--ink-3)!important;opacity:1}
+div[data-baseweb="select"]>div{background:var(--surface-2)!important;border:1px solid var(--line)!important;border-radius:12px!important;transition:border-color .2s,box-shadow .2s}
+div[data-baseweb="select"]>div:hover,div[data-baseweb="select"]>div:focus-within{border-color:var(--cobalt)!important;box-shadow:0 0 0 4px var(--cobalt-soft)}
+div[data-baseweb="select"] *{color:var(--ink)!important;-webkit-text-fill-color:var(--ink)}
+div[data-baseweb="select"] svg{fill:var(--ink-2)!important}
+div[data-baseweb="popover"]>div,div[data-baseweb="popover"] ul,div[data-baseweb="popover"] [role="listbox"]{background:var(--surface)!important;border-radius:12px;border:1px solid var(--line)}
+div[data-baseweb="popover"] li{color:var(--ink)!important;background:transparent!important}
+div[data-baseweb="popover"] li:hover,div[data-baseweb="popover"] li[aria-selected="true"]{background:var(--cobalt-soft)!important}
+div[data-baseweb="popover"] li *{color:var(--ink)!important}
+[data-testid="stExpander"] details{border:1px solid var(--line)!important;border-radius:14px!important;background:var(--surface-2)!important;margin-bottom:6px}
+[data-testid="stForm"]{border:1px solid var(--line)!important;border-radius:16px!important;background:var(--surface-2);padding:18px 20px 14px!important;margin-bottom:10px}
 .form-title{font-weight:700;font-size:15px;margin:0 0 2px;color:var(--ink)}
+.keynote{font-size:13px;color:var(--ink-2);line-height:1.55;margin:2px 0 12px}
+.keynote a,.prov a{color:var(--cobalt);text-decoration:none;font-weight:600}
+.keynote a:hover,.prov a:hover{text-decoration:underline}
+
+/* model pickers */
+.st-key-mp_w,.st-key-mp_r{background:var(--surface-2);border:1px solid var(--line);border-radius:16px;padding:16px 16px 12px}
+.role{display:flex;gap:11px;align-items:center;margin-bottom:10px}
+.role .ri{width:32px;height:32px;border-radius:10px;display:grid;place-items:center;background:var(--cobalt-soft);color:var(--cobalt);flex:none}
+.role .ri.rv{background:var(--mint-soft);color:var(--mint)}
+.role .ri svg{width:16px;height:16px}
+.role b{display:block;font-size:14.5px;color:var(--ink)}
+.role span.d{display:block;font-size:12.5px;color:var(--ink-2)}
+.prov{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:2px 0 4px;font-size:12.5px;color:var(--ink-2);animation:fade .4s var(--ease) both}
+.tag{font-weight:700;font-size:11.5px;padding:2px 9px;border-radius:999px}
+.tag.free{background:var(--mint-soft);color:var(--mint-ink)}.tag.paid{background:var(--amber-soft);color:var(--amber-ink)}
 
 /* buttons */
 .stButton>button,.stDownloadButton>button,[data-testid="stFormSubmitButton"]>button{font-family:var(--ui);font-weight:600;border-radius:999px;transition:transform .18s var(--ease),box-shadow .2s,background .2s,border-color .2s,color .2s}
-button[data-testid="stBaseButton-secondary"],button[data-testid="stBaseButton-secondaryFormSubmit"]{background:#fff;border:1px solid var(--line);color:var(--ink-2);font-size:13.5px;padding:.35rem .9rem;min-height:0}
-button[data-testid="stBaseButton-secondary"]:hover,button[data-testid="stBaseButton-secondaryFormSubmit"]:hover{border-color:var(--cobalt);color:var(--cobalt);background:var(--cobalt-soft);transform:translateY(-1px)}
-button[data-testid="stBaseButton-secondary"]:active{transform:scale(.97)}
-button[data-testid="stBaseButton-primary"]{background:var(--ink);border:none;color:#fff;font-size:16px;padding:.8rem 1.6rem;border-radius:14px;box-shadow:0 8px 20px -8px rgba(16,24,40,.5)}
-button[data-testid="stBaseButton-primary"]:hover{background:var(--cobalt);transform:translateY(-2px);box-shadow:0 14px 28px -10px rgba(59,91,255,.6)}
+.stApp button p{color:inherit!important}
+button[data-testid="stBaseButton-secondary"],button[data-testid="stBaseButton-secondaryFormSubmit"],.stDownloadButton button{background:var(--surface)!important;border:1px solid var(--line)!important;color:var(--ink-2)!important;font-size:13.5px;padding:.35rem .9rem;min-height:0}
+button[data-testid="stBaseButton-secondary"]:hover,button[data-testid="stBaseButton-secondaryFormSubmit"]:hover,.stDownloadButton button:hover{border-color:var(--cobalt)!important;color:var(--cobalt)!important;background:var(--cobalt-soft)!important;transform:translateY(-1px)}
+button[data-testid="stBaseButton-secondary"]:active,.stDownloadButton button:active{transform:scale(.97)}
+button[data-testid="stBaseButton-secondary"]:focus-visible,button[data-testid="stBaseButton-primary"]:focus-visible{outline:3px solid var(--cobalt-soft);outline-offset:2px}
+button[data-testid="stBaseButton-primary"]{position:relative;overflow:hidden;background:var(--solid)!important;border:none!important;color:var(--on-solid)!important;font-size:16px;padding:.8rem 1.6rem;border-radius:14px;box-shadow:0 8px 20px -8px rgba(16,24,40,.5)}
+button[data-testid="stBaseButton-primary"]::after{content:"";position:absolute;top:0;bottom:0;width:40%;left:-60%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.28),transparent);transform:skewX(-18deg);animation:sheen 4.5s 1.5s ease-in-out infinite}
+button[data-testid="stBaseButton-primary"]:hover{background:var(--cobalt)!important;color:#fff!important;transform:translateY(-2px);box-shadow:0 14px 28px -10px rgba(59,91,255,.6)}
 button[data-testid="stBaseButton-primary"]:active{transform:scale(.98)}
-button[data-testid="stBaseButton-primary"]:disabled{background:#D0D5DD;box-shadow:none;transform:none}
+button[data-testid="stBaseButton-primary"]:disabled{background:var(--line)!important;color:var(--ink-3)!important;box-shadow:none;transform:none}
+button[data-testid="stBaseButton-primary"]:disabled::after{display:none}
+/* pills & segmented controls */
+button[data-testid^="stBaseButton-pills"],button[data-testid^="stBaseButton-segmented_control"]{background:var(--surface-2)!important;border:1px solid var(--line)!important;color:var(--ink-2)!important;border-radius:999px;font-weight:600;transition:all .2s var(--ease)}
+button[data-testid^="stBaseButton-pills"]:hover,button[data-testid^="stBaseButton-segmented_control"]:hover{border-color:var(--cobalt)!important;color:var(--cobalt)!important}
+button[data-testid$="Active"]{background:var(--cobalt-soft)!important;border-color:var(--cobalt)!important;color:var(--cobalt)!important}
 
 /* ── keys verified ─────────────────────────────── */
 .keys-done{display:flex;align-items:center;gap:14px;padding:16px 18px;border-radius:16px;background:var(--mint-soft);
-  border:1px solid #B7E8CF;color:#067647;overflow:hidden;animation:settle .8s var(--ease) both;margin-bottom:10px}
-.keys-done .ic{width:38px;height:38px;border-radius:50%;background:var(--mint);color:#fff;display:grid;place-items:center;flex:none;
-  animation:pop .6s .15s var(--ease) both}
+  border:1px solid var(--mint-line);color:var(--mint-ink);overflow:hidden;animation:settle .8s var(--ease) both;margin-bottom:10px}
+.keys-done .ic{width:38px;height:38px;border-radius:50%;background:var(--mint);color:#fff;display:grid;place-items:center;flex:none;animation:pop .6s .15s var(--ease) both}
 .keys-done .ic svg{width:19px;height:19px}
 .keys-done b{display:block;font-size:14.5px;margin-bottom:2px}
-.keys-done span{display:block;font-size:13px;line-height:1.5;color:#12684A}
+.keys-done span.t{display:block;font-size:13px;line-height:1.5;opacity:.92}
 .keys-done .ic path{stroke-dasharray:24;stroke-dashoffset:24;animation:draw .5s .45s var(--ease) forwards}
+.vchips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.vchip{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:999px;background:var(--surface);border:1px solid var(--mint-line);font-size:12px;font-weight:600;color:var(--mint-ink)}
+.vchip svg{width:12px;height:12px}
 .keys-wait{display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:14px;background:var(--cobalt-soft);color:var(--cobalt);font-size:14px;font-weight:600;margin-bottom:10px;animation:rise .3s var(--ease) both}
 .keyres{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 10px;animation:rise .4s var(--ease) both}
 .keyres span{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:999px;font-size:12.5px;font-weight:600}
-.keyres .ok{background:var(--mint-soft);color:#067647}.keyres .no{background:var(--rose-soft);color:#B42318}
+.keyres .ok{background:var(--mint-soft);color:var(--mint-ink)}.keyres .no{background:var(--rose-soft);color:var(--rose-ink)}
 
 /* ── agent pipeline ────────────────────────────── */
-.pipe{display:flex;align-items:center;background:#fff;border:1px solid var(--line);border-radius:20px;padding:18px 22px;
-  box-shadow:0 1px 2px rgba(16,24,40,.04);margin:30px 0 22px}
+.pipe{position:relative;overflow:hidden;display:flex;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:20px;padding:18px 22px;
+  box-shadow:var(--shadow-1);margin:30px 0 22px}
+.pipe.running::before{content:"";position:absolute;left:0;top:0;height:2px;width:40%;background:linear-gradient(90deg,transparent,var(--cobalt),transparent);animation:sweep 1.5s ease-in-out infinite}
 .node{display:flex;align-items:center;gap:12px;min-width:0}
-.dot{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;border:1.5px solid var(--line);color:var(--ink-3);background:#fff;transition:all .35s var(--ease);flex:none}
+.dot{position:relative;width:42px;height:42px;border-radius:13px;display:grid;place-items:center;border:1.5px solid var(--line);color:var(--ink-3);background:var(--surface);transition:all .35s var(--ease);flex:none}
 .dot svg{width:20px;height:20px}
 .txt b{display:block;font-size:14px;font-weight:600;color:var(--ink)}
 .txt span{display:block;font-size:12.5px;color:var(--ink-3);white-space:nowrap}
 .node.active .dot{border-color:var(--cobalt);color:var(--cobalt);background:var(--cobalt-soft);animation:pulse 1.7s ease-out infinite}
+.node.active .dot::after{content:"";position:absolute;inset:-6px;border-radius:17px;border:1.5px dashed var(--cobalt);opacity:.45;animation:spin 7s linear infinite}
 .node.active .txt span{color:var(--cobalt);font-weight:600}
-.node.done .dot{background:var(--ink);border-color:var(--ink);color:#fff}
+.node.done .dot{background:var(--solid);border-color:var(--solid);color:var(--on-solid)}
 .node.done .txt span{color:var(--ink-2)}
 .node.good .dot{background:var(--mint);border-color:var(--mint);color:#fff;animation:pop .5s var(--ease)}
 .node.good .txt span{color:var(--mint);font-weight:600}
@@ -357,40 +524,40 @@ button[data-testid="stBaseButton-primary"]:disabled{background:#D0D5DD;box-shado
 .node.bad .txt span{color:var(--amber);font-weight:600}
 .node.skip .dot{border-style:dashed;opacity:.7}
 .link{flex:1;height:2px;margin:0 14px;min-width:16px;background:var(--line);border-radius:2px;position:relative;overflow:hidden}
-.link.fill{background:var(--ink)}
+.link.fill{background:var(--solid)}
 .link.flow::after{content:"";position:absolute;top:0;bottom:0;width:45%;background:linear-gradient(90deg,transparent,var(--cobalt),transparent);animation:slide 1s linear infinite}
 .tries{margin-left:18px;padding-left:20px;border-left:1px solid var(--line);flex:none}
 .tries small{display:block;font-size:12.5px;color:var(--ink-2);font-weight:600;margin-bottom:6px;white-space:nowrap}
 .tries div{display:flex;gap:5px}
 .tries em{width:18px;height:6px;border-radius:4px;background:var(--line);transition:background .4s,transform .4s var(--ease)}
-.tries em.on{background:var(--ink)}
+.tries em.on{background:var(--solid)}
 .tries em.cur{background:var(--cobalt);animation:breathe 1.4s ease-in-out infinite}
 
 /* ── post preview ──────────────────────────────── */
-.post{background:#fff;border:1px solid var(--line);border-radius:20px;overflow:hidden;position:relative;
-  box-shadow:0 1px 2px rgba(16,24,40,.04),0 24px 48px -24px rgba(16,24,40,.18)}
+.post{background:var(--surface);border:1px solid var(--line);border-radius:20px;overflow:hidden;position:relative;box-shadow:var(--shadow-2)}
 .post-head{display:flex;gap:12px;align-items:center;padding:20px 22px 4px}
-.avatar{width:50px;height:50px;border-radius:50%;background:var(--ink);color:#fff;display:grid;place-items:center;font-weight:700;font-size:18px;flex:none}
-.who b{display:block;font-size:15px;font-weight:600}
+.avatar{width:50px;height:50px;border-radius:50%;background:var(--solid);color:var(--on-solid);display:grid;place-items:center;font-weight:700;font-size:18px;flex:none}
+.who b{display:block;font-size:15px;font-weight:600;color:var(--ink)}
 .who span{display:block;font-size:12.5px;color:var(--ink-2);line-height:1.35}
-.badge-draft{margin-left:auto;font-size:12px;font-weight:600;padding:4px 10px;border-radius:999px;background:var(--cobalt-soft);color:var(--cobalt);white-space:nowrap}
-.post-body{position:relative;padding:12px 22px 20px;font-size:15.5px;line-height:1.62;color:#1D2433;min-height:210px;overflow:hidden}
-.post-body p{margin:0 0 .95em}
+.badge-draft{margin-left:auto;font-size:12px;font-weight:600;padding:4px 10px;border-radius:999px;background:var(--cobalt-soft);color:var(--cobalt);white-space:nowrap;animation:pop .45s var(--ease)}
+.post-body{position:relative;padding:12px 22px 20px;font-size:15.5px;line-height:1.62;color:var(--body);min-height:210px;overflow:hidden}
+.post-body p{margin:0 0 .95em;color:var(--body)}
 .post-body p:first-child{font-weight:600;font-size:16.5px}
 .reveal p{opacity:0;animation:rise .55s var(--ease) forwards}
-.scan::after{content:"";position:absolute;left:0;right:0;top:0;height:90px;background:linear-gradient(180deg,transparent,rgba(59,91,255,.13),transparent);border-bottom:1.5px solid rgba(59,91,255,.35);animation:scan 2.4s ease-in-out infinite}
-.skel .ln{height:12px;border-radius:7px;margin:13px 0;background:linear-gradient(90deg,#EEF1F6 25%,#F8F9FC 50%,#EEF1F6 75%);background-size:200% 100%;animation:shimmer 1.4s linear infinite}
+.scan::after{content:"";position:absolute;left:0;right:0;top:0;height:90px;background:linear-gradient(180deg,transparent,var(--cobalt-soft),transparent);border-bottom:1.5px solid var(--cobalt);animation:scan 2.4s ease-in-out infinite}
+.skel .ln{height:12px;border-radius:7px;margin:13px 0;background:linear-gradient(90deg,var(--skel-a) 25%,var(--skel-b) 50%,var(--skel-a) 75%);background-size:200% 100%;animation:shimmer 1.4s linear infinite}
 .skel.still .ln{animation:none}
 .skel .cap{font-size:13.5px;color:var(--ink-2);margin:0 0 14px;font-weight:500}
 .post-meta{display:flex;align-items:center;gap:14px;padding:12px 22px;border-top:1px solid var(--line);font-size:12.5px;color:var(--ink-2)}
+.post-meta b{color:var(--ink)}
 .meter{flex:1;height:5px;background:var(--line);border-radius:4px;overflow:hidden;max-width:180px}
-.meter i{display:block;height:100%;background:var(--mint);border-radius:4px;transition:width .8s var(--ease)}
+.meter i{display:block;height:100%;background:var(--mint);border-radius:4px;transform-origin:left;animation:grow-x 1s var(--ease) both}
 .meter i.warn{background:var(--amber)}
 .banner{display:flex;align-items:center;gap:12px;padding:14px 22px;font-size:13.5px;animation:rise .5s var(--ease) both}
 .banner b{display:block;font-size:14px}
 .banner span{color:var(--ink-2)}
-.banner.ok{background:var(--mint-soft);color:#067647}
-.banner.bad{background:var(--amber-soft);color:#B54708}
+.banner.ok{background:var(--mint-soft);color:var(--mint-ink)}
+.banner.bad{background:var(--amber-soft);color:var(--amber-ink)}
 .banner.live{background:var(--cobalt-soft);color:var(--cobalt)}
 .banner .ic{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;color:#fff;flex:none}
 .banner.ok .ic{background:var(--mint)} .banner.bad .ic{background:var(--amber)}
@@ -398,46 +565,76 @@ button[data-testid="stBaseButton-primary"]:disabled{background:#D0D5DD;box-shado
 .tick path{stroke-dasharray:24;stroke-dashoffset:24;animation:draw .5s .15s var(--ease) forwards}
 .dots i{display:inline-block;width:5px;height:5px;border-radius:50%;background:currentColor;margin-left:3px;animation:blink 1.2s infinite}
 .dots i:nth-child(2){animation-delay:.2s}.dots i:nth-child(3){animation-delay:.4s}
+.confetti{position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:3}
+.confetti i{position:absolute;top:-12px;width:7px;height:12px;border-radius:2px;opacity:0;animation:fall 1.9s var(--ease) forwards}
 
 /* ── review notes ──────────────────────────────── */
-.notes-h{font-weight:700;font-size:20px;letter-spacing:-.02em;margin:2px 0 14px}
-.note{background:#fff;border:1px solid var(--line);border-left:4px solid var(--line);border-radius:16px;padding:16px 18px;margin-bottom:12px;animation:rise .5s var(--ease) both}
+.notes-h{font-weight:700;font-size:20px;letter-spacing:-.02em;margin:2px 0 14px;color:var(--ink)}
+.note{background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--line);border-radius:16px;padding:16px 18px;margin-bottom:12px;animation:rise .5s var(--ease) both}
 .note.ok{border-left-color:var(--mint)} .note.bad{border-left-color:var(--rose)} .note.live{border-left-color:var(--cobalt)}
 .note-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
-.note-h b{font-size:14.5px}
+.note-h b{font-size:14.5px;color:var(--ink)}
 .pill{font-size:12px;font-weight:600;padding:3px 10px;border-radius:999px}
-.pill.ok{background:var(--mint-soft);color:#067647}.pill.bad{background:var(--rose-soft);color:#B42318}.pill.live{background:var(--cobalt-soft);color:var(--cobalt)}
+.pill.ok{background:var(--mint-soft);color:var(--mint-ink)}.pill.bad{background:var(--rose-soft);color:var(--rose-ink)}.pill.live{background:var(--cobalt-soft);color:var(--cobalt)}
 .note .fb{font-size:14px;line-height:1.55;color:var(--ink-2);margin:0 0 10px}
 .note .meta{font-size:12.5px;color:var(--ink-3);margin-bottom:6px}
 .note details summary{cursor:pointer;font-size:13px;font-weight:600;color:var(--cobalt);list-style:none;display:inline-flex;align-items:center;gap:6px;padding:2px 0;transition:gap .2s}
 .note details summary::-webkit-details-marker{display:none}
 .note details summary::before{content:"+";display:inline-grid;place-items:center;width:16px;height:16px;border-radius:50%;background:var(--cobalt-soft);font-size:13px;line-height:1;transition:transform .25s var(--ease)}
 .note details[open] summary::before{transform:rotate(45deg)}
-.note details .draftbox{margin-top:10px;padding:12px 14px;background:#FAFBFD;border:1px solid var(--line);border-radius:12px;font-size:13.5px;line-height:1.55;color:#344054;animation:rise .35s var(--ease) both}
-.note details .draftbox p{margin:0 0 .7em}
-.empty-note{border:1.5px dashed #CDD3DF;border-radius:16px;padding:22px;color:var(--ink-2);font-size:14px;line-height:1.55;background:rgba(255,255,255,.55)}
+.note details .draftbox{margin-top:10px;padding:12px 14px;background:var(--surface-2);border:1px solid var(--line);border-radius:12px;font-size:13.5px;line-height:1.55;color:var(--draft);animation:rise .35s var(--ease) both}
+.note details .draftbox p{margin:0 0 .7em;color:var(--draft)}
+.empty-note{border:1.5px dashed var(--line);border-radius:16px;padding:22px;color:var(--ink-2);font-size:14px;line-height:1.55;background:var(--surface-2)}
 
-.alert{background:var(--rose-soft);border:1px solid #FECDCA;color:#B42318;border-radius:14px;padding:14px 18px;font-size:14px;margin-top:14px;animation:rise .4s var(--ease) both}
-.alert code{background:#fff;padding:1px 6px;border-radius:6px}
-.keynote{font-size:13px;color:var(--ink-2);line-height:1.5;margin:2px 0 12px}
+.alert{background:var(--rose-soft);border:1px solid var(--rose-line);color:var(--rose-ink);border-radius:14px;padding:14px 18px;font-size:14px;margin-top:14px;animation:rise .4s var(--ease) both}
+.alert code{background:var(--surface);padding:1px 6px;border-radius:6px}
+.foot{margin-top:48px;text-align:center;font-size:12.5px;color:var(--ink-3)}
 
 /* ── keyframes ─────────────────────────────────── */
 @keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
-@keyframes settle{from{max-height:380px;opacity:0;transform:scale(.97)}to{max-height:220px;opacity:1;transform:none}}
+@keyframes fade{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes lift{from{transform:translateY(105%)}to{transform:none}}
+@keyframes grow-x{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+@keyframes drift{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(3%,2.5%,0) scale(1.1)}}
+@keyframes settle{from{max-height:380px;opacity:0;transform:scale(.97)}to{max-height:260px;opacity:1;transform:none}}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(59,91,255,.4)}70%{box-shadow:0 0 0 12px rgba(59,91,255,0)}100%{box-shadow:0 0 0 0 rgba(59,91,255,0)}}
 @keyframes pop{0%{transform:scale(.7)}60%{transform:scale(1.12)}100%{transform:scale(1)}}
 @keyframes slide{from{left:-45%}to{left:100%}}
+@keyframes sweep{from{left:-40%}to{left:100%}}
+@keyframes sheen{0%,60%{left:-60%}100%{left:140%}}
 @keyframes shimmer{from{background-position:200% 0}to{background-position:-200% 0}}
 @keyframes scan{0%{top:-90px}100%{top:100%}}
 @keyframes draw{to{stroke-dashoffset:0}}
 @keyframes blink{0%,80%,100%{opacity:.25}40%{opacity:1}}
 @keyframes breathe{0%,100%{transform:scaleX(1)}50%{transform:scaleX(1.25)}}
+@keyframes breathe-dot{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.5);opacity:.55}}
 @keyframes spin{to{transform:rotate(360deg)}}
+@keyframes fall{0%{opacity:1;transform:translate3d(0,0,0) rotate(0)}100%{opacity:0;transform:translate3d(var(--dx),420px,0) rotate(var(--r))}}
 
 @media (max-width:760px){
-  .txt span{display:none}.pipe{padding:14px}.tries{display:none}.hero{padding-top:32px}
+  .txt span{display:none}.pipe{padding:14px}.tries{display:none}.hero{padding-top:28px}
+  .st-key-composer{padding:18px 16px 12px}.sep{margin:20px -16px 18px}
 }
-@media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;animation-iteration-count:1!important;transition:none!important}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;animation-delay:0s!important;transition:none!important}}
+</style>
+"""
+
+DARK_VARS = """
+<style>
+:root{
+  --paper:#0A0E17; --surface:#111826; --surface-2:#0D1320; --ink:#EDF1F9; --ink-2:#A3AEC4; --ink-3:#6C7791;
+  --line:#222C40; --dot:#18202F; --cobalt:#7089FF; --cobalt-soft:rgba(112,137,255,.16);
+  --mint:#2FD58B; --mint-ink:#5BE3A8; --mint-soft:rgba(47,213,139,.13); --mint-line:rgba(47,213,139,.32);
+  --rose:#FF6B61; --rose-ink:#FF9C94; --rose-soft:rgba(255,107,97,.13); --rose-line:rgba(255,107,97,.32);
+  --amber:#FDB022; --amber-ink:#FEC84B; --amber-soft:rgba(253,176,34,.13);
+  --solid:#E7ECF7; --on-solid:#0A0E17; --body:#DDE3F0; --draft:#C3CCDD;
+  --skel-a:#1A2236; --skel-b:#25304A;
+  --glow1:rgba(112,137,255,.17); --glow2:rgba(47,213,139,.09);
+  --shadow-1:0 1px 2px rgba(0,0,0,.4);
+  --shadow-2:0 1px 2px rgba(0,0,0,.4),0 28px 56px -24px rgba(0,0,0,.75);
+}
+.stApp[data-testid="stApp"]{color-scheme:dark}
+button[data-testid="stBaseButton-primary"]{box-shadow:0 8px 24px -10px rgba(112,137,255,.45)}
 </style>
 """
 
@@ -472,6 +669,11 @@ def esc(t: str) -> str:
     return html.escape(t).replace("$", "&#36;")
 
 
+def short(t: str, n: int = 70) -> str:
+    t = " ".join(t.split())
+    return t if len(t) <= n else t[: n - 1].rstrip() + "…"
+
+
 def paras(text: str, animate: bool = False) -> str:
     blocks = [b for b in re.split(r"\n\s*\n", text.strip()) if b.strip()]
     out = []
@@ -481,9 +683,32 @@ def paras(text: str, animate: bool = False) -> str:
     return "".join(out)
 
 
-def new_run(topic="", tone="Thoughtful", max_attempts=3) -> dict:
+def step_html(n: int, title: str, desc: str) -> str:
+    return h(f'<div class="step"><span class="n">{n}</span><div><b>{title}</b><span class="d">{desc}</span></div></div>')
+
+
+def topbar_html() -> str:
+    (_, wm), (_, rm) = resolve("w"), resolve("r")
+    return h(
+        f"""<div class="topbar">
+        <div class="brand"><div class="mark">{svg("loop")}</div>Draftwise</div>
+        <div class="models">
+          <span class="chip"><i></i><b>Writer</b>{esc(short(wm or "choose a model", 26))}</span>
+          <span class="chip"><i class="g"></i><b>Reviewer</b>{esc(short(rm or "choose a model", 26))}</span>
+        </div></div>"""
+    )
+
+
+HERO_HTML = h(
+    """<div class="hero"><div class="rule"></div>
+    <h1><span><b>Posts that survive</b></span><span><b>a second reader.</b></span></h1>
+    <p>A writer agent drafts. A strict reviewer pushes back. The loop repeats until your LinkedIn post is ready to publish.</p></div>"""
+)
+
+
+def new_run(topic="", tone="Thoughtful", max_attempts=3, research=True) -> dict:
     return {
-        "topic": topic, "tone": tone, "max_attempts": max_attempts,
+        "topic": topic, "tone": tone, "max_attempts": max_attempts, "research": research,
         "stage": "idle",          # idle | writing | searching | writing_post | reviewing | done
         "attempt": 1, "draft": "", "queries_now": [], "searched_now": False,
         "history": [], "approved": False, "fresh": False, "error": "",
@@ -493,9 +718,12 @@ def new_run(topic="", tone="Thoughtful", max_attempts=3) -> dict:
 def pipeline_html(run: dict) -> str:
     s, att, mx = run["stage"], run["attempt"], run["max_attempts"]
     idle = s == "idle"
+    off = not run.get("research", True)
 
     w = "idle" if idle else ("active" if s in ("writing", "writing_post") else "done")
-    if s == "searching":
+    if off:
+        r = "skip"
+    elif s == "searching":
         r = "active"
     elif run["searched_now"] and s in ("writing_post", "reviewing", "done"):
         r = "done"
@@ -509,17 +737,17 @@ def pipeline_html(run: dict) -> str:
     nq = len(run["queries_now"])
     sub = {
         "w": {"idle": "Waiting", "active": f"Writing draft {att}", "done": f"Draft {att} written"}[w],
-        "r": {"idle": "When needed", "active": "Searching the web", "skip": "Not needed",
+        "r": {"idle": "When needed", "active": "Searching the web", "skip": "Turned off" if off else "Not needed",
               "done": f"{nq} search{'es' if nq != 1 else ''}"}[r],
         "v": {"idle": "Strict critic", "active": f"Reading draft {att}", "done": "Verdict in"}[v],
         "f": {"idle": "Publish-ready", "good": "Approved", "bad": "Out of drafts"}[f],
     }
     icon = {"w": "pen", "r": "search", "v": "eye", "f": "flag"}
-    icon_done = lambda st_, k: svg("check") if st_ in ("done", "good") else svg(icon[k])
 
     def node(k, label, st_):
+        ic = svg("check") if st_ in ("done", "good") else svg(icon[k])
         return (
-            f'<div class="node {st_}"><div class="dot">{icon_done(st_, k)}</div>'
+            f'<div class="node {st_}"><div class="dot">{ic}</div>'
             f'<div class="txt"><b>{label}</b><span>{sub[k]}</span></div></div>'
         )
 
@@ -536,9 +764,10 @@ def pipeline_html(run: dict) -> str:
         for i in range(mx)
     )
     tries = f"Draft {att} of {mx}" if not idle else f"Up to {mx} drafts"
+    running = "pipe running" if s not in ("idle", "done") else "pipe"
 
     return h(
-        f"""<div class="pipe">
+        f"""<div class="{running}">
         {node("w", "Writer", w)}{link(w, r)}
         {node("r", "Research", r)}{link(r if r != "skip" else w, v)}
         {node("v", "Reviewer", v)}{link(v, f)}
@@ -548,9 +777,15 @@ def pipeline_html(run: dict) -> str:
     )
 
 
-def short(t: str, n: int = 70) -> str:
-    t = " ".join(t.split())
-    return t if len(t) <= n else t[: n - 1].rstrip() + "…"
+def confetti_html() -> str:
+    rnd = random.Random(11)
+    cols = ["var(--cobalt)", "var(--mint)", "var(--amber)", "var(--rose)", "var(--solid)"]
+    bits = "".join(
+        f'<i style="left:{rnd.randint(4, 96)}%;background:{cols[i % 5]};--dx:{rnd.randint(-70, 70)}px;'
+        f'--r:{rnd.randint(-420, 420)}deg;animation-delay:{rnd.uniform(0, .4):.2f}s"></i>'
+        for i in range(28)
+    )
+    return f'<div class="confetti">{bits}</div>'
 
 
 def post_html(run: dict, animate: bool) -> str:
@@ -561,7 +796,7 @@ def post_html(run: dict, animate: bool) -> str:
     headline = short(topic) if topic.strip() else "Your topic appears here"
     initials = "".join(p[0] for p in name.split()[:2]).upper() or "Y"
 
-    badge = f'<span class="badge-draft">Draft {att}</span>' if s != "idle" else ""
+    badge = f'<span class="badge-draft" key="{att}">Draft {att}</span>' if s != "idle" else ""
     head = (
         f'<div class="post-head"><div class="avatar">{esc(initials)}</div>'
         f'<div class="who"><b>{esc(name)}</b><span>{esc(headline)}</span><span>Now · 🌐</span></div>{badge}</div>'
@@ -616,7 +851,8 @@ def post_html(run: dict, animate: bool) -> str:
             f'<div><b>Not fully approved</b><span>Reached the limit of {run["max_attempts"]} drafts. '
             "This is the latest version — worth a light edit.</span></div></div>"
         )
-    return h(f'<div class="post">{head}{body}{meta}{banner}</div>')
+    party = confetti_html() if (animate and s == "done" and run["approved"]) else ""
+    return h(f'<div class="post">{party}{head}{body}{meta}{banner}</div>')
 
 
 def notes_html(run: dict) -> str:
@@ -652,16 +888,21 @@ def render(ph: dict, run: dict, animate: bool = False):
     ph["notes"].markdown(notes_html(run), unsafe_allow_html=True)
 
 
-def copy_button(text: str):
+def copy_button(text: str, dark: bool = False):
     payload = json.dumps(text).replace("</", "<\\/")
+    c = (
+        dict(bg="#111826", line="#222C40", ink="#A3AEC4", hov="#7089FF", hbg="rgba(112,137,255,.16)")
+        if dark
+        else dict(bg="#fff", line="#E4E8F0", ink="#475467", hov="#3B5BFF", hbg="#E8ECFF")
+    )
     components.html(
         f"""
         <style>
           @import url('https://fonts.googleapis.com/css2?family=Figtree:wght@600&display=swap');
-          body{{margin:0}}
-          button{{width:100%;height:42px;border-radius:999px;border:1px solid #E4E8F0;background:#fff;color:#475467;
+          body{{margin:0;background:transparent}}
+          button{{width:100%;height:42px;border-radius:999px;border:1px solid {c['line']};background:{c['bg']};color:{c['ink']};
                  font:600 13.5px Figtree,system-ui,sans-serif;cursor:pointer;transition:all .2s cubic-bezier(.22,.8,.3,1)}}
-          button:hover{{border-color:#3B5BFF;color:#3B5BFF;background:#E8ECFF;transform:translateY(-1px)}}
+          button:hover{{border-color:{c['hov']};color:{c['hov']};background:{c['hbg']};transform:translateY(-1px)}}
           button:active{{transform:scale(.97)}}
           button.ok{{background:#12B76A;border-color:#12B76A;color:#fff}}
         </style>
@@ -684,7 +925,7 @@ def copy_button(text: str):
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  PDF EXPORT (reportlab)
+#  PDF EXPORT (reportlab) — always print-friendly light styling
 # ════════════════════════════════════════════════════════════════════════
 
 def _pdf_clean(t: str) -> str:
@@ -742,7 +983,6 @@ def build_pdf(run: dict, author: str) -> bytes:
         HRFlowable(width="100%", thickness=0.8, color=LINE, spaceAfter=16),
     ]
 
-    # the post, in a card
     cell = []
     for i, b in enumerate(blocks):
         cell.append(Paragraph(_pdf_clean(b).replace("\n", "<br/>"), st_hook if i == 0 else st_body))
@@ -758,7 +998,6 @@ def build_pdf(run: dict, author: str) -> bytes:
     ]))
     story += [card, Spacer(1, 16)]
 
-    # summary strip
     status = Paragraph(
         f'<font color="{(MINT if approved else AMBER).hexval()}"><b>'
         f'{"Approved by reviewer" if approved else "Not fully approved"}</b></font>', st_meta)
@@ -796,26 +1035,41 @@ def build_pdf(run: dict, author: str) -> bytes:
 #  PAGE
 # ════════════════════════════════════════════════════════════════════════
 
-st.markdown(CSS, unsafe_allow_html=True)
+ss = st.session_state
 
-st.markdown(
-    h(
-        f"""<div class="topbar">
-        <div class="brand"><div class="mark">{svg("loop")}</div>Draftwise</div>
-        <div class="models">
-          <span class="chip"><i></i>Writer · GPT-4o mini</span>
-          <span class="chip"><i class="g"></i>Reviewer · gpt-oss-120b</span>
-        </div></div>
-        <div class="hero"><h1>Posts that survive a second reader.</h1>
-        <p>A writer agent drafts. A strict reviewer pushes back. The loop repeats until your LinkedIn post is ready to publish.</p></div>"""
-    ),
-    unsafe_allow_html=True,
-)
+
+def _default_theme() -> str:
+    """Open in the viewer's system theme when Streamlit can tell us (>=1.46); otherwise light."""
+    try:
+        t = st.context.theme.type
+        return t if t in ("light", "dark") else "light"
+    except Exception:  # noqa: BLE001
+        return "light"
+
+
+def _toggle_theme():
+    ss["theme"] = "light" if ss.get("theme") == "dark" else "dark"
+
+
+ss.setdefault("theme", _default_theme())
+dark = ss["theme"] == "dark"
+st.markdown(CSS + (DARK_VARS if dark else ""), unsafe_allow_html=True)
 
 # defaults
-st.session_state.setdefault("topic", "")
-st.session_state.setdefault("name", "Your Name")
-st.session_state.setdefault("max_attempts", 3)
+ss.setdefault("topic", "")
+ss.setdefault("name", "Your Name")
+for _r in ("w", "r"):
+    ss.setdefault(f"{_r}_prov", DEFAULT_PROV[_r])
+
+with st.container(key="topbar"):
+    tl, tr = st.columns([5, 1], vertical_alignment="center")
+    tl.markdown(topbar_html(), unsafe_allow_html=True)
+    tr.button(
+        "Light" if dark else "Dark",
+        icon=":material/light_mode:" if dark else ":material/dark_mode:",
+        key="theme_btn", on_click=_toggle_theme, help="Switch between light and dark mode",
+    )
+st.markdown(HERO_HTML, unsafe_allow_html=True)
 
 EXAMPLES = [
     "AI pilots that stall after the demo",
@@ -826,29 +1080,39 @@ EXAMPLES = [
 
 
 def _use_example(t):
-    st.session_state.topic = t
+    ss.topic = t
 
 
 def _reset():
-    st.session_state.pop("run", None)
-    st.session_state.topic = ""
+    ss.pop("run", None)
+    ss.topic = ""
 
 
-KEYS_DONE_HTML = h(
-    f"""<div class="keys-done"><div class="ic">{svg("check")}</div>
-    <div><b>API keys verified</b>
-    <span>Your keys are not stored on any server — they stay in this browser session only
-    and disappear when you close the tab.</span></div></div>"""
-)
-
-
-def _show_keys_done(slot):
-    with slot.container():
-        st.markdown(KEYS_DONE_HTML, unsafe_allow_html=True)
-        st.button("Change keys", on_click=_clear_keys, key="change_keys")
+def model_picker(role: str, title: str, sub: str, icon: str, cls: str):
+    with st.container(key=f"mp_{role}"):
+        st.markdown(
+            h(f'<div class="role"><span class="ri {cls}">{svg(icon)}</span>'
+              f'<div><b>{title}</b><span class="d">{sub}</span></div></div>'),
+            unsafe_allow_html=True,
+        )
+        pid = st.selectbox(
+            "Provider", list(PROVIDERS), key=f"{role}_prov",
+            format_func=lambda p: f"{PROVIDERS[p]['label']}  ·  {PROVIDERS[p]['tag']}",
+        )
+        P = PROVIDERS[pid]
+        m = st.selectbox("Model", P["models"] + [CUSTOM], key=f"{role}_model_{pid}")
+        if m == CUSTOM:
+            st.text_input("Custom model ID", key=f"{role}_custom_{pid}", placeholder="Paste the exact model ID")
+        st.markdown(
+            h(f'<div class="prov"><span class="tag {"free" if P["free"] else "paid"}">{P["tag"]}</span>'
+              f'<span>{P["blurb"]}</span><a href="{P["url"]}" target="_blank" rel="noopener">Get a key</a></div>'),
+            unsafe_allow_html=True,
+        )
 
 
 with st.container(key="composer"):
+    # ── 1 · topic ───────────────────────────────────────────────
+    st.markdown(step_html(1, "Topic and tone", "What is the post about, and how should it sound?"), unsafe_allow_html=True)
     st.text_area(
         "What should the post be about?",
         key="topic",
@@ -865,63 +1129,86 @@ with st.container(key="composer"):
         selection_mode="single", default="Thoughtful", key="tone",
     ) or "Thoughtful"
 
+    # ── 2 · models ──────────────────────────────────────────────
+    st.markdown('<div class="sep"></div>', unsafe_allow_html=True)
+    st.markdown(step_html(2, "Choose your models", "Pick any provider for each role. Several have free tiers."), unsafe_allow_html=True)
+    mc1, mc2 = st.columns(2, gap="medium")
+    with mc1:
+        model_picker("w", "Writer", "Drafts and revises the post", "pen", "")
+    with mc2:
+        model_picker("r", "Reviewer", "Judges each draft strictly", "eye", "rv")
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    st.segmented_control(
+        "Web research with Tavily", ["On", "Off"], default="On", key="research",
+        help="The writer can search the web for current facts. Turn off to skip the Tavily key.",
+    )
+
     with st.expander("Settings"):
         a, c = st.columns([1.4, 1])
         a.text_input("Display name", key="name")
-        c.slider("Max drafts", 1, 5, key="max_attempts")
+        c.segmented_control("Max drafts", [1, 2, 3, 4, 5], default=3, key="max_attempts")
 
-    # ── API keys: verify on submit, then collapse into a short note ──
-    keys_slot = st.empty()
+    # ── 3 · keys ────────────────────────────────────────────────
+    st.markdown('<div class="sep"></div>', unsafe_allow_html=True)
+    st.markdown(step_html(3, "Connect your keys", "Only the providers you picked need a key."), unsafe_allow_html=True)
+
+    needed = needed_ids()
+    creds = ss.setdefault("creds", {})
+    missing = [k for k in needed if k not in creds]
     status_slot = st.empty()
 
-    if st.session_state.get("creds"):
-        _show_keys_done(keys_slot)
+    if not missing:
+        chips = "".join(f'<span class="vchip">{svg("check")}{esc(key_label(k).replace(" API key", ""))}</span>' for k in needed)
+        st.markdown(
+            h(f"""<div class="keys-done"><div class="ic">{svg("check")}</div>
+            <div><b>API keys verified</b>
+            <span class="t">Your keys are not stored on any server. They stay in this browser session only
+            and disappear when you close the tab.</span><div class="vchips">{chips}</div></div></div>"""),
+            unsafe_allow_html=True,
+        )
+        st.button("Change keys", on_click=_clear_keys, key="change_keys")
     else:
-        with keys_slot.container():
-            with st.form("keys_form", border=False):
-                st.markdown(
-                    '<div class="form-title">Connect your API keys</div>'
-                    '<div class="keynote">Paste your keys, then press <b>Verify keys</b>. '
-                    "They’re checked once and never written to disk.</div>",
-                    unsafe_allow_html=True,
-                )
-                entered = {}
-                for kid, (label, ph_) in KEY_FIELDS.items():
-                    entered[kid] = st.text_input(
-                        label, key=f"in_{kid}", type="password",
-                        autocomplete="off", placeholder=ph_,
-                    )
-                submitted = st.form_submit_button("Verify keys", use_container_width=True)
+        links = " · ".join(f'<a href="{key_url(k)}" target="_blank" rel="noopener">{esc(key_label(k))}</a>' for k in missing)
+        with st.form("keys_form", border=False):
+            st.markdown(
+                '<div class="form-title">Add your API keys</div>'
+                '<div class="keynote">Paste the keys, then press <b>Verify keys</b>. They are checked once and never '
+                f"written to disk. Need one? {links}</div>",
+                unsafe_allow_html=True,
+            )
+            entered = {
+                k: st.text_input(key_label(k), key=f"in_{k}", type="password", autocomplete="off", placeholder=key_ph(k))
+                for k in missing
+            }
+            submitted = st.form_submit_button("Verify keys", use_container_width=True)
 
         if submitted:
             clean = {k: v.strip() for k, v in entered.items()}
             status_slot.markdown(
-                '<div class="keys-wait"><span class="dots"><i></i><i></i><i></i></span>'
-                "Checking your keys…</div>",
+                '<div class="keys-wait"><span class="dots"><i></i><i></i><i></i></span>Checking your keys…</div>',
                 unsafe_allow_html=True,
             )
             results = validate_keys(clean)
             if all(ok for ok, _ in results.values()):
-                st.session_state["creds"] = clean
-                status_slot.empty()
-                keys_slot.empty()
-                _show_keys_done(keys_slot)
+                creds.update(clean)
+                ss["creds"] = creds
+                st.rerun()
             else:
                 chips = "".join(
                     f'<span class="{"ok" if ok else "no"}">{"✓" if ok else "✕"} '
-                    f'{esc(KEY_FIELDS[k][0])}{"" if ok else " — " + esc(msg)}</span>'
+                    f'{esc(key_label(k))}{"" if ok else " — " + esc(msg)}</span>'
                     for k, (ok, msg) in results.items()
                 )
                 status_slot.markdown(h(f'<div class="keyres">{chips}</div>'), unsafe_allow_html=True)
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-    keys_ready = bool(st.session_state.get("creds"))
+    keys_ready = not missing
     go = st.button("Generate post", type="primary", disabled=not keys_ready, use_container_width=True)
 
 if not keys_ready:
     st.markdown(
         h('<div class="alert"><b>Verify your API keys to continue.</b> '
-          "Paste them in the form above and press <b>Verify keys</b>.</div>"),
+          "Paste them in step 3 and press <b>Verify keys</b>.</div>"),
         unsafe_allow_html=True,
     )
 
@@ -935,13 +1222,16 @@ with right:
     ph["notes"] = st.empty()
 
 if go:
-    if not st.session_state.topic.strip():
+    if not ss.topic.strip():
         st.toast("Add a topic first.", icon="✏️")
-        render(ph, new_run(max_attempts=st.session_state.max_attempts))
+        render(ph, new_run(max_attempts=max_attempts(), research=research_on()))
+    elif not resolve("w")[1] or not resolve("r")[1]:
+        st.toast("Enter a custom model ID, or pick one from the list.", icon="🧩")
+        render(ph, new_run(max_attempts=max_attempts(), research=research_on()))
     else:
-        run = new_run(st.session_state.topic.strip(), tone, st.session_state.max_attempts)
+        run = new_run(ss.topic.strip(), tone, max_attempts(), research_on())
         run.update(stage="writing", fresh=True)
-        st.session_state.run = run
+        ss.run = run
         render(ph, run)
 
         init = {
@@ -991,32 +1281,33 @@ if go:
         except Exception as exc:  # noqa: BLE001
             err_text = str(exc)
             # never echo API keys back to the screen
-            for v in (st.session_state.get("creds") or {}).values():
+            for v in (ss.get("creds") or {}).values():
                 if v:
                     err_text = err_text.replace(v, "••••")
             run["error"] = err_text
             run["stage"] = "done" if run["draft"] else "idle"
             render(ph, run)
             st.markdown(
-                h(f'<div class="alert"><b>Something went wrong.</b> {esc(run["error"][:400])}</div>'),
+                h(f'<div class="alert"><b>Something went wrong.</b> {esc(run["error"][:400])} '
+                  "If this mentions tools or function calling, pick a different writer model or turn web research off.</div>"),
                 unsafe_allow_html=True,
             )
         run["fresh"] = False
-        st.session_state.run = run
+        ss.run = run
 else:
-    run = st.session_state.get("run") or new_run(max_attempts=st.session_state.max_attempts)
+    run = ss.get("run") or new_run(max_attempts=max_attempts(), research=research_on())
     render(ph, run)
 
 # actions once a draft exists
-final = st.session_state.get("run")
+final = ss.get("run")
 if final and final["stage"] == "done" and final["draft"]:
     with actions:
         st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
         c1, c2, c3 = st.columns(3)
         with c1:
-            copy_button(final["draft"])
+            copy_button(final["draft"], dark)
         try:
-            pdf_bytes = build_pdf(final, st.session_state.get("name", ""))
+            pdf_bytes = build_pdf(final, ss.get("name", ""))
             c2.download_button(
                 "Download PDF", pdf_bytes, file_name="linkedin_post.pdf",
                 mime="application/pdf", use_container_width=True, key="dl",
@@ -1025,3 +1316,5 @@ if final and final["stage"] == "done" and final["draft"]:
             c2.button("Download PDF", disabled=True, use_container_width=True, key="dl_off")
             st.caption("PDF export needs reportlab — run `pip install reportlab`.")
         c3.button("Start over", on_click=_reset, use_container_width=True, key="reset")
+
+st.markdown('<div class="foot">Draftwise runs on your own keys. Nothing is stored beyond this session.</div>', unsafe_allow_html=True)
